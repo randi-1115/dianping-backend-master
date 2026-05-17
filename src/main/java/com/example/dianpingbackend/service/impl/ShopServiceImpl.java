@@ -9,12 +9,15 @@ import com.example.dianpingbackend.mapper.ShopMapper;
 import com.example.dianpingbackend.service.ShopService;
 import com.example.dianpingbackend.utils.CacheConstants;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Random;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 @Service
@@ -28,6 +31,14 @@ public class ShopServiceImpl implements ShopService {
     @Autowired
     private StringRedisTemplate redisTemplate;//Redis操作对象
 
+    //Lua脚本：原子性解锁
+    private static final String UNLOCK_SCRIPT =
+            "if redis.call('get',KEYS[1]) == ARGV[1] then" +
+                    "  return redis.call('del',KEYS[1]) " +
+                    "else " +
+                    "  return 0 " +
+                    "end";//如果锁的值与传入的值相同，则删除锁，否则不做任何操作
+
     @Override
     //只加Redis缓存并设置较短TTL
     public Result<List<Shop>> getAllShops() {
@@ -40,7 +51,7 @@ public class ShopServiceImpl implements ShopService {
         }
         //如果缓存中没有数据，从数据库中查询，并将结果存入缓存，设置较短的TTL（过期时间）
         List<Shop> shops = shopMapper.selectAll();
-        redisTemplate.opsForValue().set(key,JSONUtil.toJsonStr(shops),5, TimeUnit.MINUTES);
+        redisTemplate.opsForValue().set(key,JSONUtil.toJsonStr(shops),CacheConstants.CACHE_SHOP_ALL_TTL, TimeUnit.MINUTES);
         return Result.ok("查询成功", shops);
     }
 
@@ -74,12 +85,13 @@ public class ShopServiceImpl implements ShopService {
         //缓存击穿：当某个热点数据（访问量很高的数据）在缓存中失效时，可能会有大量的请求同时访问数据库，导致数据库压力过大，甚至崩溃。
         //互斥锁：当多个线程同时请求同一个数据时，只有一个线程能够获得锁并查询数据库，其他线程需要等待锁释放后才能继续执行。这样可以避免多个线程同时查询数据库导致的缓存击穿问题。
         String lockKey = CacheConstants.LOCK_SHOP_KEY + id;
+        String lockValue = UUID.randomUUID().toString();
         try {
             //尝试获得分布式锁
             //setIfAbsent方法：如果key不存在，则设置key的值为value，并返回true；如果key已经存在，则不做任何操作，并返回false。
             // 通过这个方法，我们可以确保只有一个线程能够成功获得锁，其他线程需要等待锁释放后才能继续执行。
             Boolean locked = redisTemplate.opsForValue()//opsForValue()方法：表示要操作字符串类型数据
-                    .setIfAbsent(lockKey,"1", CacheConstants.LOCK_TTL, TimeUnit.SECONDS);
+                    .setIfAbsent(lockKey,lockValue, CacheConstants.LOCK_TTL, TimeUnit.SECONDS);
             //(锁名，锁值，过期时间，时间单位）
             if (Boolean.TRUE.equals(locked)){
                 //获取锁成功，再次查询redis缓存，防止在获取锁的过程中其他线程已经将数据写入缓存
@@ -106,24 +118,22 @@ public class ShopServiceImpl implements ShopService {
                 }
                 //写入redis缓存和本地缓存
                 //将shop对象转换为JSON字符串，并存入Redis缓存中，设置过期时间为CacheConstants.CACHE_SHOP_TTL分钟
-                int baseTtl = 30;
+                int baseTtl = CacheConstants.CACHE_SHOP_TTL;
                 int randomOffset = new Random().nextInt(5);
                 redisTemplate.opsForValue().set(key,JSONUtil.toJsonStr(shop),
                         baseTtl+randomOffset, TimeUnit.MINUTES);
                 localCache.put(key,shop);
                 return Result.ok("查询成功", shop);
-            }else{//获取锁失败，说明有其他线程正在查询数据库，我们等待一段时间后重试
-                Thread.sleep(50);//等待50毫秒后重试
-                return getShopById(id);//递归调用getShopById方法，继续尝试获取数据 (现在也返回Result了)
+            }else{
+                return Result.fail(429, "系统繁忙，请稍后再试");
             }
-        }catch (InterruptedException e){
-            Thread.currentThread().interrupt();
-            // 降级：直接查数据库
-            shop = shopMapper.selectById(id);
-            return shop != null ? Result.ok("查询成功", shop) : Result.fail(404, "店铺不存在");
         }finally {
             //释放锁 无论怎样 还锁
-            redisTemplate.delete(lockKey);
+            redisTemplate.execute(
+                    new DefaultRedisScript<>(UNLOCK_SCRIPT,Long.class),
+                    Collections.singletonList(lockKey),
+                    lockValue
+            );
         }
     }
     @Override
@@ -136,7 +146,8 @@ public class ShopServiceImpl implements ShopService {
             //删除Redis缓存
             String key = CacheConstants.CACHE_SHOP_KEY + shop.getId();
             redisTemplate.delete(key);
-            //本地缓存有TTL自动过期 无需处理
+            //删除本地缓存
+            localCache.invalidate(key);
             return Result.ok("更新成功");
         }
         return Result.fail(400, "更新失败，店铺ID可能不存在");
@@ -161,6 +172,7 @@ public class ShopServiceImpl implements ShopService {
             String key = CacheConstants.CACHE_SHOP_KEY + id;
             redisTemplate.delete(key);
             redisTemplate.delete("cache:shop:all");
+            localCache.invalidate(key);
             return Result.ok("删除成功");
         }
         return Result.fail(400, "删除失败，店铺不存在");
@@ -170,25 +182,93 @@ public class ShopServiceImpl implements ShopService {
     //根据分类查询商铺列表
     //为了提高查询效率，我们可以在Redis中使用一个Hash数据结构来存储每个分类对应的商铺列表。
     // Hash是一种键值对集合，可以通过分类作为key，商铺列表作为value进行存储和查询。
+    //防穿透/击穿
     public Result<List<Shop>> getShopsByCategory(String category) {
         String key = "cache:shop:category:"+category;
         String json = redisTemplate.opsForValue().get(key);
+        //空值标记
+        if("".equals(json)){
+            return Result.ok("查询成功", Collections.emptyList());
+        }
         if(StrUtil.isNotBlank(json)){
             return Result.ok("查询成功", JSONUtil.toList(json, Shop.class));
         }
-        List<Shop> shops = shopMapper.selectByCategory(category);
-        redisTemplate.opsForValue().set(key,JSONUtil.toJsonStr(shops),10, TimeUnit.MINUTES);
-        return Result.ok("查询成功", shops);
+        String lockKey = CacheConstants.LOCK_SHOP_KEY + "category:" + category;
+        String lockValue = UUID.randomUUID().toString();
+        try {
+            Boolean locked = redisTemplate.opsForValue()
+                    .setIfAbsent(lockKey,lockValue, CacheConstants.LOCK_TTL , TimeUnit.SECONDS);
+            if (Boolean.TRUE.equals(locked)) {
+                json = redisTemplate.opsForValue().get(key);
+                if(StrUtil.isNotBlank(json)) {
+                    return Result.ok("查询成功", JSONUtil.toList(json, Shop.class));
+                }
+                if("".equals(json)){
+                    return Result.ok("查询成功", Collections.emptyList());
+                }
+                List<Shop> shops = shopMapper.selectByCategory(category);
+                if(shops.isEmpty()) {
+                    int randomOffset = new Random().nextInt(10);
+                    redisTemplate.opsForValue().set(key,"",CacheConstants.CACHE_NULL_TTL+randomOffset,TimeUnit.SECONDS);
+                } else {
+                    int baseTtl = CacheConstants.CACHE_CATEGORY_TTL;
+                    redisTemplate.opsForValue().set(key,JSONUtil.toJsonStr(shops),
+                            baseTtl,TimeUnit.MINUTES);
+                }
+                return Result.ok("查询成功", shops);
+            }else {
+                return Result.fail(429, "系统繁忙，请稍后再试");
+            }
+            } finally {
+                redisTemplate.execute(
+                        new DefaultRedisScript<>(UNLOCK_SCRIPT,Long.class),
+                        Collections.singletonList(lockKey),lockValue
+                );
+            }
     }
+    //防穿透/击穿
     @Override
     public Result<List<Shop>> searchShops(String keyword) {
-        String key = "cache:shop:search:"+keyword;
+        String key = "cache:shop:search:" + keyword;
         String json = redisTemplate.opsForValue().get(key);
-        if(StrUtil.isNotBlank(json)){
+        if ("".equals(json)) {
+            return Result.ok("查询成功", Collections.emptyList());
+        }
+        if (StrUtil.isNotBlank(json)) {
             return Result.ok("查询成功", JSONUtil.toList(json, Shop.class));
         }
-        List<Shop> shops = shopMapper.selectByKeyword(keyword);
-        redisTemplate.opsForValue().set(key,JSONUtil.toJsonStr(shops),2, TimeUnit.MINUTES);
-        return Result.ok("查询成功", shops);
+
+        String lockKey = CacheConstants.LOCK_SHOP_KEY + "search:" + keyword;
+        String lockValue = UUID.randomUUID().toString();
+        try {
+            Boolean locked = redisTemplate.opsForValue()
+                    .setIfAbsent(lockKey, lockValue, CacheConstants.LOCK_TTL, TimeUnit.SECONDS);
+            if (Boolean.TRUE.equals(locked)) {
+                json = redisTemplate.opsForValue().get(key);
+                if (StrUtil.isNotBlank(json)) {
+                    return Result.ok("查询成功", JSONUtil.toList(json, Shop.class));
+                }
+                if ("".equals(json)) {
+                    return Result.ok("查询成功", Collections.emptyList());
+                }
+                List<Shop> shops = shopMapper.selectByKeyword(keyword);
+                if (shops.isEmpty()) {
+                    int randomOffset = new Random().nextInt(10);
+                    redisTemplate.opsForValue().set(key, "", CacheConstants.CACHE_NULL_TTL + randomOffset, TimeUnit.SECONDS);
+                } else {
+                    int baseTtl = CacheConstants.CACHE_SEARCH_TTL;
+                    redisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shops),
+                            baseTtl, TimeUnit.MINUTES);
+                }
+                return Result.ok("查询成功", shops);
+            } else {
+                return Result.fail(429, "系统繁忙，请稍后再试");
+            }
+        } finally {
+            redisTemplate.execute(
+                    new DefaultRedisScript<>(UNLOCK_SCRIPT, Long.class),
+                    Collections.singletonList(lockKey), lockValue
+            );
+        }
     }
 }

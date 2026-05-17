@@ -9,15 +9,19 @@ import com.example.dianpingbackend.mapper.SeckillVoucherMapper;
 import com.example.dianpingbackend.mapper.UserMapper;
 import com.example.dianpingbackend.service.SeckillService;
 import com.example.dianpingbackend.utils.RedisLock;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
+
+@Slf4j
 @Service
 public class SeckillServiceImpl implements SeckillService {
     @Autowired
@@ -32,11 +36,11 @@ public class SeckillServiceImpl implements SeckillService {
     @Autowired
     private UserMapper userMapper;
 
-    //线程池 用于异步处理订单
-    //原因：秒杀活动中，订单的创建和库存的扣减可能会比较耗时，如果在主线程中处理，可能会导致用户体验变差，甚至出现请求超时的情况。
-    // 通过使用线程池，我们可以将订单的处理放在一个独立的线程中，这样主线程就可以快速响应用户的请求，提高系统的吞吐量和响应速度。
-    private final ExecutorService executor = Executors.newFixedThreadPool(10);
-    //根据实际情况调整线程池大小
+    private final ThreadPoolExecutor executor = new ThreadPoolExecutor(
+            10, 20, 60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(200),
+        new ThreadPoolExecutor.CallerRunsPolicy()
+    );
 
     //库存前缀和用户订单前缀
     private static final String STOCK_KEY="seckill:stock:";
@@ -91,24 +95,28 @@ public class SeckillServiceImpl implements SeckillService {
             redisTemplate.opsForSet().add(userOrderKey,userId.toString());
             //6.异步处理订单
             //为了提高系统的响应速度，我们可以将订单的处理放在一个独立的线程中，这样主线程就可以快速响应用户的请求，提高系统的吞吐量和响应速度
-            executor.submit(() -> {//把一段代码（Runnable）丢给线程池里的一个工人去执行，主线程马上继续往下走
+            executor.submit(() -> {
+                boolean deducted = false;
                 try {
-                    int rows=voucherMapper.deductStock(voucherId);//扣减库存，使用数据库的行锁机制来确保库存的正确性，通过执行一条UPDATE语句来扣减库存数量，如果扣减成功，返回受影响的行数，如果扣减失败（例如库存不足），返回0。
-                    if(rows == 0){//扣减库存失败，说明库存不足，需要将预扣的库存数量加回去，并返回相应的提示信息。
-                        redisTemplate.opsForValue().increment(stockKey);//加回预扣的库存数量
-                        redisTemplate.opsForSet().remove(userOrderKey,userId.toString());//移除用户的购买标记
-                        return ;
+                    int rows = voucherMapper.deductStock(voucherId);
+                    if (rows == 0) {
+                        redisTemplate.opsForValue().increment(stockKey);
+                        redisTemplate.opsForSet().remove(userOrderKey, userId.toString());
+                        return;
                     }
-                    //创建订单
+                    deducted = true;
                     SeckillOrder order = new SeckillOrder();
                     order.setVoucherId(voucherId);
                     order.setUserId(userId);
-                    order.setState(0);//订单状态 0-待支付 1-已支付 2-已取消
-                    orderMapper.insert(order);//将订单信息插入数据库中
-                }catch (Exception e){
-                    //如果在订单处理过程中发生异常，我们需要将预扣的库存数量加回去，并移除用户的购买标记，以确保系统的正确性和一致性。
+                    order.setState(0);
+                    orderMapper.insert(order);
+                } catch (Exception e) {
+                    log.error("秒杀异步下单失败 userId={} voucherId={}", userId, voucherId, e);
                     redisTemplate.opsForValue().increment(stockKey);
-                    redisTemplate.opsForSet().remove(userOrderKey,userId.toString());
+                    redisTemplate.opsForSet().remove(userOrderKey, userId.toString());
+                    if (deducted) {
+                        voucherMapper.incrementStock(voucherId);
+                    }
                 }
             });
             return Result.ok("抢购成功，订单处理中");

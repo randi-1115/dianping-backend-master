@@ -27,12 +27,11 @@
         WHERE id = #{id}
     </update>
     <!-- 按id删除店铺 -->
-    <delete id="deleteByid" parameterType="java.lang.Long">
+    <delete id="deleteById" parameterType="java.lang.Long">
         DELETE FROM shops WHERE id = #{id}
     </delete>
     <!-- 按品类查询 -->
-    <select id="selec
-    tByCategory" parameterType="java.lang.String" resultType="com.example.dianpingbackend.entity.Shop">
+    <select id="selectByCategory" parameterType="java.lang.String" resultType="com.example.dianpingbackend.entity.Shop">
         SELECT * FROM shops WHERE category = #{category}
     </select>
     <!-- 模糊搜索（名称或地址包含关键词） -->
