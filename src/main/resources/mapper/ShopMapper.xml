@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.dianpingbackend.mapper.ShopMapper">
+    <!-- 查询所有店铺 -->
+    <select id="selectAll" resultType="com.example.dianpingbackend.entity.Shop">
+        SELECT * FROM shops
+    </select>
+    <!-- 按ID查询单个店铺 -->
+    <select id="selectById" parameterType="java.lang.Long" resultType="com.example.dianpingbackend.entity.Shop">
+        SELECT * FROM shops WHERE id = #{id}
+    </select>
+    <!-- 新增店铺 -->
+    <insert id="insert" parameterType="com.example.dianpingbackend.entity.Shop" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO shops (name,address,score,category,longitude,latitude,create_time,update_time)
+        VALUE (#{name},#{address},#{score},#{category},#{longitude},#{latitude},NOW(),NOW())
+    </insert>
+    <!-- 更新店铺 -->
+    <update id="update" parameterType="com.example.dianpingbackend.entity.Shop">
+        UPDATE shops
+        SET name = #{name},
+            address = #{address},
+            score = #{score},
+            category = #{category},
+            longitude = #{longitude},
+            latitude = #{latitude},
+            update_time = NOW()
+        WHERE id = #{id}
+    </update>
+    <!-- 按id删除店铺 -->
+    <delete id="deleteByid" parameterType="java.lang.Long">
+        DELETE FROM shops WHERE id = #{id}
+    </delete>
+    <!-- 按品类查询 -->
+    <select id="selec
+    tByCategory" parameterType="java.lang.String" resultType="com.example.dianpingbackend.entity.Shop">
+        SELECT * FROM shops WHERE category = #{category}
+    </select>
+    <!-- 模糊搜索（名称或地址包含关键词） -->
+    <select id="selectByKeyword" parameterType="java.lang.String" resultType="com.example.dianpingbackend.entity.Shop">
+        SELECT * FROM shops
+        WHERE name LIKE  CONCAT('%',#{keyword},'%')
+            OR address LIKE CONCAT ('%',#{keyword},'%')
+    </select>
+    <select id = "selectBatchIds" parameterType="java.util.List" resultType="com.example.dianpingbackend.entity.Shop">
+          SELECT * FROM shops
+          WHERE id IN
+          <foreach  item="id" collection="list" open="(" separator="," close=")">
+              #{id}
+          </foreach>
+    </select>
+
+</mapper>
